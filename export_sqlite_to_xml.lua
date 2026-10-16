@@ -1,31 +1,201 @@
 #!/usr/bin/env lua
 -- export_sqlite_to_xml.lua
+--
 -- Dumps every table of both SQLite databases into two XML files.
--- Requires only the `sqlite3` CLI in $PATH (no Lua SQLite binding needed).
+-- The XML shape is described by a small Mustache-like template below.
+-- Requires only the `sqlite3` CLI in $PATH.
 --
 -- Usage:
 --   lua export_sqlite_to_xml.lua
---   (or chmod +x and run ./export_sqlite_to_xml.lua)
 
 ----------------------------------------------------------------------
--- Helpers
+-- TEMPLATE  (the format description — edit here to change the XML)
+----------------------------------------------------------------------
+--
+--   {{name}}               substitute a scalar
+--   {{#list}}...{{/list}}  repeat the block for each item of `list`
+--   {{^list}}...{{/list}}  render only when `list` is empty
+--   {{! comment }}         ignored
+--
+-- A section tag alone on its own line has that line's whitespace and
+-- newline stripped, so vertical formatting in the template does not
+-- leak into the output.
+--
+-- Data exposed to the template:
+--   name          database name (string)
+--   file          database file path (string)
+--   tables[]      one entry per SQLite table
+--     name          table name
+--     rows[]        one entry per row
+--       fields[]      non-NULL columns: { name, value }
+--       nulls[]       NULL columns:     { name }
+
+local TEMPLATE = [[<?xml version="1.0" encoding="UTF-8"?>
+<database name="{{name}}" file="{{file}}">
+{{#tables}}
+  <table name="{{name}}">
+{{#rows}}
+    <row>
+{{#fields}}
+      <{{name}}>{{value}}</{{name}}>
+{{/fields}}
+{{#nulls}}
+      <{{name}} null="true"/>
+{{/nulls}}
+    </row>
+{{/rows}}
+  </table>
+{{/tables}}
+</database>
+]]
+
+----------------------------------------------------------------------
+-- TEMPLATE ENGINE  (Mustache-lite)
 ----------------------------------------------------------------------
 
--- Escape a string for XML text / attribute content.
+-- Strip whitespace and newline around section tags that sit on their
+-- own line.  This lets the template above stay readable without those
+-- blank lines appearing in the output.
+local function preprocess_standalone(tpl)
+  local out = {}
+  local pos = 1
+  while pos <= #tpl do
+    local eol = tpl:find("\n", pos, true)
+    local line, next_pos
+    if eol then
+      line     = tpl:sub(pos, eol)   -- includes \n
+      next_pos = eol + 1
+    else
+      line     = tpl:sub(pos)
+      next_pos = #tpl + 1
+    end
+    local tag = line:match("^[ \t]*({{[#^/][^}]*}})[ \t]*\n$")
+    if tag then
+      out[#out + 1] = tag            -- drop the newline
+    else
+      out[#out + 1] = line
+    end
+    pos = next_pos
+  end
+  return table.concat(out)
+end
+
+-- Parse a template into a tree of nodes.
+local function parse_template(tpl)
+  tpl = preprocess_standalone(tpl)
+  local root  = { children = {} }
+  local stack = { root }
+  local pos   = 1
+
+  while true do
+    local s, e = tpl:find("{{", pos, true)
+    if not s then
+      if pos <= #tpl then
+        local top = stack[#stack]
+        top.children[#top.children + 1] =
+          { type = "text", value = tpl:sub(pos) }
+      end
+      break
+    end
+    if s > pos then
+      local top = stack[#stack]
+      top.children[#top.children + 1] =
+        { type = "text", value = tpl:sub(pos, s - 1) }
+    end
+    local tag_end = tpl:find("}}", e + 1, true)
+    if not tag_end then error("unclosed {{ tag at offset " .. s) end
+    local raw = tpl:sub(e + 1, tag_end - 1)
+    pos = tag_end + 2          -- <<< FIX: skip BOTH closing braces
+
+    local kind, name = "var", raw
+    local c = raw:sub(1, 1)
+    if     c == "#" then kind, name = "section", raw:sub(2)
+    elseif c == "^" then kind, name = "inverse", raw:sub(2)
+    elseif c == "/" then kind, name = "end",     raw:sub(2)
+    elseif c == "!" then kind, name = "comment", ""
+    end
+    name = name:match("^%s*(.-)%s*$")
+
+    if kind == "comment" then
+      -- skip
+    elseif kind == "end" then
+      if #stack < 2 then error("unexpected {{/" .. name .. "}}") end
+      local top = table.remove(stack)
+      if top.name ~= name then
+        error("mismatched {{/" .. name ..
+              "}} (expected {{/" .. top.name .. "}})")
+      end
+    else
+      local node = { type = kind, name = name, children = {} }
+      local top = stack[#stack]
+      top.children[#top.children + 1] = node
+      if kind == "section" or kind == "inverse" then
+        stack[#stack + 1] = node
+      end
+    end
+  end
+  if #stack > 1 then
+    error("unclosed section {{#" .. stack[#stack].name .. "}}")
+  end
+  return root.children
+end
+
+-- Render a list of nodes against a scope table.
+local function render_nodes(nodes, scope)
+  local buf = {}
+  for _, n in ipairs(nodes) do
+    if n.type == "text" then
+      buf[#buf + 1] = n.value
+
+    elseif n.type == "var" then
+      local v = scope[n.name]
+      if type(v) == "string" or type(v) == "number" then
+        buf[#buf + 1] = tostring(v)
+      end
+
+    elseif n.type == "section" then
+      local v = scope[n.name]
+      if type(v) == "table" then
+        for _, item in ipairs(v) do
+          local child = (type(item) == "table") and item or scope
+          buf[#buf + 1] = render_nodes(n.children, child)
+        end
+      elseif v == true then
+        buf[#buf + 1] = render_nodes(n.children, scope)
+      end
+
+    elseif n.type == "inverse" then
+      local v = scope[n.name]
+      if v == nil or v == false or (type(v) == "table" and #v == 0) then
+        buf[#buf + 1] = render_nodes(n.children, scope)
+      end
+    end
+  end
+  return table.concat(buf)
+end
+
+local TEMPLATE_AST = parse_template(TEMPLATE)
+
+local function render(scope)
+  return render_nodes(TEMPLATE_AST, scope)
+end
+
+----------------------------------------------------------------------
+-- HELPERS
+----------------------------------------------------------------------
+
 local function xml_escape(s)
   if s == nil then return "" end
   s = tostring(s)
-  -- strip characters not allowed by XML 1.0
   s = s:gsub("[%z\1-\8\11\12\14-\31]", "")
-  s = s:gsub("&", "&amp;")
-  s = s:gsub("<", "&lt;")
-  s = s:gsub(">", "&gt;")
-  s = s:gsub('"', "&quot;")
-  s = s:gsub("'", "&apos;")
+  s = s:gsub("&",  "&amp;")
+  s = s:gsub("<",  "&lt;")
+  s = s:gsub(">",  "&gt;")
+  s = s:gsub('"',  "&quot;")
+  s = s:gsub("'",  "&apos;")
   return s
 end
 
--- Decode a hex string produced by SQLite's hex() into raw bytes.
 local function hex_decode(s)
   if s == nil or s == "" then return "" end
   return (s:gsub("%x%x", function(cc)
@@ -33,12 +203,10 @@ local function hex_decode(s)
   end))
 end
 
--- Shell-quote a single argument (POSIX).
 local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
--- Run a command and return stdout.
 local function run_cmd(cmd)
   local f = io.popen(cmd, "r")
   if not f then return nil end
@@ -47,7 +215,6 @@ local function run_cmd(cmd)
   return out
 end
 
--- Run a SQL statement through sqlite3 CLI.
 local function sqlite(db, sql, sep)
   local cmd
   if sep then
@@ -61,7 +228,7 @@ local function sqlite(db, sql, sep)
 end
 
 ----------------------------------------------------------------------
--- Introspection
+-- INTROSPECTION
 ----------------------------------------------------------------------
 
 local function list_tables(db)
@@ -75,11 +242,10 @@ local function list_tables(db)
   return t
 end
 
-local function table_columns(db, table)
-  local out = sqlite(db, "PRAGMA table_info(" .. table .. ");")
+local function table_columns(db, table_name)
+  local out = sqlite(db, "PRAGMA table_info(" .. table_name .. ");")
   local cols = {}
   for line in out:gmatch("[^\r\n]+") do
-    -- cid|name|type|notnull|dflt_value|pk
     local name = line:match("^%d+|([^|]+)")
     if name then cols[#cols + 1] = name end
   end
@@ -87,12 +253,8 @@ local function table_columns(db, table)
 end
 
 ----------------------------------------------------------------------
--- Row fetching (NULL-safe, binary-safe)
+-- ROW FETCHING  (NULL-safe, binary-safe)
 ----------------------------------------------------------------------
--- We select each column as either the literal string "NULL" (when the
--- SQL value is NULL) or its hex() representation.  The hex() output
--- only ever contains [0-9A-F], so our chosen field separator "|" is
--- guaranteed not to collide with any value.
 
 local SEP = "|"
 
@@ -125,9 +287,9 @@ local function fetch_rows(db, table_name, cols)
       local col = cols[idx]
       if col then
         if v == "NULL" then
-          row[col] = nil            -- SQL NULL
+          row[col] = nil
         else
-          row[col] = hex_decode(v)  -- decoded bytes (UTF-8 text normally)
+          row[col] = hex_decode(v)
         end
       end
     end
@@ -137,53 +299,57 @@ local function fetch_rows(db, table_name, cols)
 end
 
 ----------------------------------------------------------------------
--- Export one database to XML
+-- BUILD TEMPLATE SCOPE
 ----------------------------------------------------------------------
 
-local function export_db(db_path, out_path, db_name)
-  local f, err = io.open(out_path, "w")
-  if not f then
-    error("cannot open " .. out_path .. ": " .. tostring(err))
-  end
-
-  f:write('<?xml version="1.0" encoding="UTF-8"?>\n')
-  f:write(string.format('<database name="%s" file="%s">\n',
-    xml_escape(db_name), xml_escape(db_path)))
-
-  for _, table in ipairs(list_tables(db_path)) do
-    local cols = table_columns(db_path, table)
-    f:write(string.format('  <table name="%s">\n', xml_escape(table)))
-
-    for _, row in ipairs(fetch_rows(db_path, table, cols)) do
-      f:write('    <row>\n')
+local function build_scope(db_path, db_name)
+  local tables = {}
+  for _, table_name in ipairs(list_tables(db_path)) do
+    local cols = table_columns(db_path, table_name)
+    local rows = {}
+    for _, row in ipairs(fetch_rows(db_path, table_name, cols)) do
+      local fields, nulls = {}, {}
       for _, col in ipairs(cols) do
         local v = row[col]
         if v == nil then
-          f:write(string.format('      <%s null="true"/>\n',
-            xml_escape(col)))
+          nulls[#nulls + 1]  = { name = xml_escape(col) }
         else
-          f:write(string.format('      <%s>%s</%s>\n',
-            xml_escape(col), xml_escape(v), xml_escape(col)))
+          fields[#fields + 1] = { name = xml_escape(col),
+                                  value = xml_escape(v) }
         end
       end
-      f:write('    </row>\n')
+      rows[#rows + 1] = { fields = fields, nulls = nulls }
     end
-
-    f:write('  </table>\n')
+    tables[#tables + 1] = { name = xml_escape(table_name), rows = rows }
   end
+  return {
+    name   = xml_escape(db_name),
+    file   = xml_escape(db_path),
+    tables = tables,
+  }
+end
 
-  f:write('</database>\n')
+----------------------------------------------------------------------
+-- EXPORT
+----------------------------------------------------------------------
+
+local function export_db(db_path, out_path, db_name)
+  local scope = build_scope(db_path, db_name)
+  local xml   = render(scope)
+  local f, err = io.open(out_path, "w")
+  if not f then error("cannot open " .. out_path .. ": " .. tostring(err)) end
+  f:write(xml)
   f:close()
 end
 
 ----------------------------------------------------------------------
--- Main
+-- MAIN
 ----------------------------------------------------------------------
 
 local jobs = {
   {
-    db   = "dicionariolatino.com/latin_portuguese."
-             .. "4accb9e9ffd47e0856d7d7957f6548cbe531d8701d42c211431f746e6c2ada8a.db",
+    db   = "dicionariolatino.com/latin_portuguese." ..
+             "4accb9e9ffd47e0856d7d7957f6548cbe531d8701d42c211431f746e6c2ada8a.db",
     out  = "dicionariolatino_dump.xml",
     name = "dicionariolatino",
   },
@@ -202,4 +368,3 @@ for _, j in ipairs(jobs) do
     io.stderr:write(string.format("[FAIL] %s : %s\n", j.db, tostring(err)))
   end
 end
-
