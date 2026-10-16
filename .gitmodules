@@ -1,0 +1,6 @@
+[submodule "dicionariolatino.com"]
+	path = dicionariolatino.com
+	url = https://github.com/haller33/dicionariolatino.com
+[submodule "latin_to_narsese"]
+	path = latin_to_narsese
+	url = https://github.com/haller33/latin_to_narsese.git
