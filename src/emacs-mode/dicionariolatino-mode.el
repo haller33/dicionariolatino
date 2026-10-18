@@ -15,6 +15,8 @@
 
 ;;; Code:
 
+(require 'hideshow)
+
 (defconst dicionariolatino--lemma-re
   "<lex:lemma[^>]*>\\([^<]+\\)</lex:lemma>"
   "Regex matching a lemma; capture group 1 is the word.")
@@ -25,6 +27,7 @@
     (define-key map (kbd "C-c C-h") #'dicionariolatino-search-hash)
     (define-key map (kbd "C-c C-n") #'dicionariolatino-next-word)
     (define-key map (kbd "C-c C-d") #'dicionariolatino-diff)
+    (define-key map (kbd "C-c C-v") #'dicionariolatino-split-view)
     map))
 
 (defun dicionariolatino--all-words ()
@@ -78,6 +81,50 @@
     (error (user-error "XML not well-formed: %s"
                        (error-message-string err)))))
 
+(defun dicionariolatino--entry-bounds ()
+  "Retorna as posições (início . fim) da entrada atual."
+  (save-excursion
+    (when (re-search-backward "<lex:DictionaryEntry" nil t)
+      (let ((start (match-beginning 0)))
+        (when (re-search-forward "</lex:DictionaryEntry>" nil t)
+          (cons start (match-end 0)))))))
+
+(defun dicionariolatino-split-view ()
+  "Divide a tela: esquerda para edição focada, direita para o XML completo."
+  (interactive)
+  (let ((bounds (dicionariolatino--entry-bounds)))
+    (unless bounds
+      (user-error "Cursor não está dentro de uma <lex:DictionaryEntry>"))
+    (let ((start (car bounds))
+          (end (cdr bounds)))
+      
+      ;; 1. Divide a tela
+      (delete-other-windows)
+      (split-window-right)
+      
+      ;; 2. Janela da direita: XML completo focado na entrada
+      (other-window 1)
+      (goto-char start)
+      (recenter 0)
+      
+      ;; 3. Janela da esquerda: Edição Focada (Indirect Buffer)
+      (other-window 1)
+      (let ((indirect (clone-indirect-buffer "*dicionariolatino-entry*" nil t)))
+        (switch-to-buffer indirect)
+        (narrow-to-region start end)
+        (hs-minor-mode 1)                ;; Permite colapsar as tags XML
+        (hs-hide-all)                    ;; Esconde as tags para ficar limpo
+        
+        ;; 4. Header dinâmico com Palavra e Hash
+        (setq-local header-line-format
+                    '(:eval (save-excursion
+                              (goto-char (point-min))
+                              (format " Word: %s | Hash: %s"
+                                      (or (and (re-search-forward dicionariolatino--lemma-re nil t) 
+                                               (match-string 1)) "?")
+                                      (or (and (re-search-forward "<dcterms:identifier>\\([^<]+\\)" nil t) 
+                                               (match-string 1)) "?")))))))))
+
 ;;;###autoload
 (define-derived-mode dicionariolatino-mode xml-mode "Dicionariolatino"
   "Major mode for editing dicionariolatino RDF/XML dumps."
@@ -90,46 +137,6 @@
 (add-to-list 'auto-mode-alist
              '("/dicionariolatino[^/]*\\.xml\\'" . dicionariolatino-mode))
 
-(defun dicionariolatino--entry-bounds ()
-  "Retorna as posições (início . fim) da entrada atual."
-  (save-excursion
-    (when (re-search-backward "<lex:DictionaryEntry" nil t)
-      (let ((start (match-beginning 0)))
-        (when (re-search-forward "</lex:DictionaryEntry>" nil t)
-          (cons start (match-end 0)))))))
-
-(defun dicionariolatino-split-view ()
-  "Divide a tela: esquerda para edição focada, direita para o XML completo."
-  (interactive)
-  (let* ((bounds (dicionariolatino--entry-bounds))
-         (start (car bounds))
-         (end (cdr bounds)))
-    (unless bounds (user-error "Cursor não está dentro de uma DictionaryEntry"))
-    
-    ;; 1. Divide a tela e configura a janela da direita (XML completo)
-    (delete-other-windows)
-    (split-window-right)
-    (other-window 1)
-    (goto-char start)
-    (recenter 0)
-    
-    ;; 2. Configura a janela da esquerda (Edição Focada)
-    (other-window 1)
-    (let ((indirect (clone-indirect-buffer "*dicionariolatino-entry*" nil t)))
-      (switch-to-buffer indirect)
-      (narrow-to-region start end)     ;; Mostra apenas esta entrada
-      (hs-minor-mode 1)                ;; Permite colapsar as tags XML
-      (hs-hide-all)                    ;; Esconde as tags para ficar limpo
-      
-      ;; 3. Cria o cabeçalho dinâmico com Palavra e Hash
-      (setq-local header-line-format
-                  '(:eval (save-excursion
-                            (goto-char (point-min))
-                            (format " Word: %s | Hash: %s"
-                                    (or (and (re-search-forward dicionariolatino--lemma-re nil t) 
-                                             (match-string 1)) "?")
-                                    (or (and (re-search-forward "<dcterms:identifier>\\([^<]+\\)" nil t) 
-                                             (match-string 1)) "?"))))))))
-
 (provide 'dicionariolatino-mode)
+;;; dicionariolatino-mode.el ends here
 ;;; dicionariolatino-mode.el ends here
