@@ -31,6 +31,32 @@
 --       nulls[]       NULL columns:     { name }
 
 local TEMPLATE = [[<?xml version="1.0" encoding="UTF-8"?>
+<rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:lex="http://purl.org/lex#"
+    xmlns:dcterms="http://purl.org/dc/terms/"
+    xml:base="https://dicionariolatino.com/entry/">
+{{#entries}}
+  <lex:DictionaryEntry rdf:about="{{word_hash}}">
+    <lex:lemma xml:lang="la">{{word}}</lex:lemma>
+    <lex:headword xml:lang="la">{{word}}</lex:headword>
+{{#found}}
+    <lex:definition xml:lang="pt">{{definition}}</lex:definition>
+    <lex:rawHtml rdf:parseType="Literal">{{raw_html}}</lex:rawHtml>
+{{/found}}
+{{^found}}
+    <lex:status>not-found</lex:status>
+{{/found}}
+    <dcterms:identifier>{{content_hash}}</dcterms:identifier>
+{{#source_pdf}}
+    <dcterms:source rdf:resource="https://dicionariolatino.com/{{source_pdf}}"/>
+{{/source_pdf}}
+  </lex:DictionaryEntry>
+{{/entries}}
+</rdf:RDF>
+]]
+
+local TEMPLATE_XML_OLD = [[<?xml version="1.0" encoding="UTF-8"?>
 <database name="{{name}}" file="{{file}}">
 {{#tables}}
   <table name="{{name}}">
@@ -301,8 +327,44 @@ end
 ----------------------------------------------------------------------
 -- BUILD TEMPLATE SCOPE
 ----------------------------------------------------------------------
+local function is_found(row)
+  
+  -- if not row.definition then return false end
+  -- if row.definition == "No Results Found.   Sorry :(" then return false end
+  -- if row.content_hash == "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9" then return false end
+  return true
+end
 
 local function build_scope(db_path, db_name)
+  local entries = {}
+  for _, table_name in ipairs(list_tables(db_path)) do
+    local cols = table_columns(db_path, table_name)
+    local has_word = false
+    for _, c in ipairs(cols) do if c == "word" then has_word = true end end
+    if has_word then
+      for _, row in ipairs(fetch_rows(db_path, table_name, cols)) do
+        local found = is_found(row)
+        local source = nil
+        if row.raw_html then
+          source = row.raw_html:match('href="(pagina/[^"]+)"')
+        end
+        entries[#entries + 1] = {
+          word_hash    = xml_escape(row.word_hash),
+          word         = xml_escape(row.word),
+          content_hash = xml_escape(row.content_hash),
+          found        = found,
+          definition   = found and xml_escape(row.definition) or "",
+          -- raw_html NÃO é escapado: parseType="Literal" quer o HTML real
+          raw_html     = found and (row.raw_html or "") or "",
+          source_pdf   = source and xml_escape(source) or "",
+        }
+      end
+    end
+  end
+  return { entries = entries }
+end
+
+local function build_scope_OLD(db_path, db_name)
   local tables = {}
   for _, table_name in ipairs(list_tables(db_path)) do
     local cols = table_columns(db_path, table_name)
