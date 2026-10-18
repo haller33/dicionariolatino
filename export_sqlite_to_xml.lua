@@ -350,13 +350,8 @@ local jobs = {
   {
     db   = "dicionariolatino.com/latin_portuguese." ..
              "4accb9e9ffd47e0856d7d7957f6548cbe531d8701d42c211431f746e6c2ada8a.db",
-    out  = "dicionariolatino_dump.xml",
+    out  = "dicionariolatino.xml",
     name = "dicionariolatino",
-  },
-  {
-    db   = "latin_to_narsese/narseses_latim_portugues.db",
-    out  = "latin_to_narsese_dump.xml",
-    name = "latin_to_narsese",
   },
 }
 
