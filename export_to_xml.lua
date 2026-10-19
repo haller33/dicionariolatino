@@ -1,12 +1,13 @@
 #!/usr/bin/env lua
--- export_sqlite_to_xml.lua
+-- export_to_xml.lua
 --
 -- Dumps every table of both SQLite databases into two XML files.
 -- The XML shape is described by a small Mustache-like template below.
 -- Requires only the `sqlite3` CLI in $PATH.
 --
 -- Usage:
---   lua export_sqlite_to_xml.lua
+--   lua export_to_xml.lua
+--   luac -p export_to_xml.lua    -- só verifica sintaxe
 
 ----------------------------------------------------------------------
 -- TEMPLATE  (the format description — edit here to change the XML)
@@ -14,7 +15,7 @@
 --
 --   {{name}}               substitute a scalar
 --   {{#list}}...{{/list}}  repeat the block for each item of `list`
---   {{^list}}...{{/list}}  render only when `list` is empty
+--   {{^list}}...{{/list}}  render only when `list` is empty/false
 --   {{! comment }}         ignored
 --
 -- A section tag alone on its own line has that line's whitespace and
@@ -30,18 +31,20 @@
 --       fields[]      non-NULL columns: { name, value }
 --       nulls[]       NULL columns:     { name }
 
-local TEMPLATE = [[<?xml version="1.0" encoding="UTF-8"?>
+local TEMPLATE_RDF = [[<?xml version="1.0" encoding="UTF-8"
+?>
 <rdf:RDF
-    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-
+ns#"
     xmlns:lex="http://purl.org/lex#"
     xmlns:dcterms="http://purl.org/dc/terms/"
     xml:base="https://dicionariolatino.com/entry/">
 {{#entries}}
   <lex:DictionaryEntry rdf:about="{{word_hash}}">
     <lex:lemma xml:lang="la">{{word}}</lex:lemma>
-    <lex:headword xml:lang="la">{{word}}</lex:headword>
-{{#found}}
-    <lex:definition xml:lang="pt">{{definition}}</lex:definition>
+    <lex:headword xml:lang="la">{{word}}</lex:headword>-{{#found}}
+    <lex:definition xml:lang="pt">{{definition}}</lex:d
+efinition>
     <lex:rawHtml rdf:parseType="Literal">{{raw_html}}</lex:rawHtml>
 {{/found}}
 {{^found}}
@@ -56,7 +59,8 @@ local TEMPLATE = [[<?xml version="1.0" encoding="UTF-8"?>
 </rdf:RDF>
 ]]
 
-local TEMPLATE_XML_OLD = [[<?xml version="1.0" encoding="UTF-8"?>
+
+local TEMPLATE = [==[<?xml version="1.0" encoding="UTF-8"?>
 <database name="{{name}}" file="{{file}}">
 {{#tables}}
   <table name="{{name}}">
@@ -73,7 +77,15 @@ local TEMPLATE_XML_OLD = [[<?xml version="1.0" encoding="UTF-8"?>
   </table>
 {{/tables}}
 </database>
-]]
+]==]
+
+----------------------------------------------------------------------
+-- COLUMNS TO SKIP  (add names here to omit them from the dump)
+----------------------------------------------------------------------
+
+local SKIP_COLUMNS = {
+  raw_html = true,
+}
 
 ----------------------------------------------------------------------
 -- TEMPLATE ENGINE  (Mustache-lite)
@@ -131,7 +143,7 @@ local function parse_template(tpl)
     local tag_end = tpl:find("}}", e + 1, true)
     if not tag_end then error("unclosed {{ tag at offset " .. s) end
     local raw = tpl:sub(e + 1, tag_end - 1)
-    pos = tag_end + 2          -- <<< FIX: skip BOTH closing braces
+    pos = tag_end + 2          -- skip BOTH closing braces
 
     local kind, name = "var", raw
     local c = raw:sub(1, 1)
@@ -273,7 +285,9 @@ local function table_columns(db, table_name)
   local cols = {}
   for line in out:gmatch("[^\r\n]+") do
     local name = line:match("^%d+|([^|]+)")
-    if name then cols[#cols + 1] = name end
+    if name and not SKIP_COLUMNS[name] then
+      cols[#cols + 1] = name
+    end
   end
   return cols
 end
@@ -327,15 +341,17 @@ end
 ----------------------------------------------------------------------
 -- BUILD TEMPLATE SCOPE
 ----------------------------------------------------------------------
+
+
 local function is_found(row)
-  
+
   -- if not row.definition then return false end
   -- if row.definition == "No Results Found.   Sorry :(" then return false end
   -- if row.content_hash == "32aaccb0c4597738cc2fca23b28557802587b9a9fa91d5c8c54beae8aedee5d9" then return false end
   return true
 end
 
-local function build_scope(db_path, db_name)
+ local function build_scope_rdf(db_path, db_name)
   local entries = {}
   for _, table_name in ipairs(list_tables(db_path)) do
     local cols = table_columns(db_path, table_name)
@@ -346,7 +362,7 @@ local function build_scope(db_path, db_name)
         local found = is_found(row)
         local source = nil
         if row.raw_html then
-          source = row.raw_html:match('href="(pagina/[^"]+)"')
+	   source = row.raw_html:match('href="(pagina/[^"]+)"')
         end
         entries[#entries + 1] = {
           word_hash    = xml_escape(row.word_hash),
@@ -364,7 +380,8 @@ local function build_scope(db_path, db_name)
   return { entries = entries }
 end
 
-local function build_scope_OLD(db_path, db_name)
+
+local function build_scope(db_path, db_name)
   local tables = {}
   for _, table_name in ipairs(list_tables(db_path)) do
     local cols = table_columns(db_path, table_name)
@@ -376,6 +393,15 @@ local function build_scope_OLD(db_path, db_name)
         if v == nil then
           nulls[#nulls + 1]  = { name = xml_escape(col) }
         else
+          -- Insert a synthetic "lemma" field right before "word".
+          -- In a Latin dictionary the "word" column IS the lemma,
+          -- so we duplicate its value under a more explicit tag.
+          if col == "word" then
+            fields[#fields + 1] = {
+              name  = "lemma",
+              value = xml_escape(v),
+            }
+          end
           fields[#fields + 1] = { name = xml_escape(col),
                                   value = xml_escape(v) }
         end
@@ -396,8 +422,8 @@ end
 ----------------------------------------------------------------------
 
 local function export_db(db_path, out_path, db_name)
-  local scope = build_scope(db_path, db_name)
-  local xml   = render(scope)
+  local scope  = build_scope(db_path, db_name)
+  local xml    = render(scope)
   local f, err = io.open(out_path, "w")
   if not f then error("cannot open " .. out_path .. ": " .. tostring(err)) end
   f:write(xml)
